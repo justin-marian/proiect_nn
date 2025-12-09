@@ -219,14 +219,34 @@ def validate_semi_supervised(student, dt_test, device, cfg_metrics : Metrics):
         loss += sum(loss_dict.values()).item()
 
     metrics_dict = metrics.compute()  
-    return metrics_dict, loss / max(1, len(dt_test))
+    metrics_dict["validation_loss"] = loss / max(1, len(dt_test)) 
+    return metrics_dict
     
+
+class EarlyStopper:
+    def __init__(self, patience=8, min_delta=0.0):
+        self.patience = patience
+        self.min_delta = min_delta
+        self.best_loss = float("inf")
+        self.counter = 0
+        self.should_stop = False
+
+    def step(self, val_loss):
+        if val_loss < self.best_loss - self.min_delta:
+            self.best_loss = val_loss
+            self.counter = 0
+        else:
+            self.counter += 1
+        
+        if self.counter >= self.patience:
+            self.should_stop = True
 
 def run_semi_supervised_pipeline(checkpoint_path, epochs, dt_labeled, dt_weak, dt_strong, dt_test):
     student, _, _ = load_checkpoint(checkpoint_path=checkpoint_path, optimizer=None, device=device)
     teacher = RobustEMA(student)
     optimizer = torch.optim.SGD(student.parameters(), lr=1e-3, momentum=0.9)
-    lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.5)
+    lr_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=4, threshold=1e-3, min_lr=1e-5)
+    early_stopper = EarlyStopper(min_delta=1e-3)
     cfg_metrics = Metrics(num_classes=21)
     history = {}
     for key in METRIC_SUPERVISED:
@@ -240,8 +260,9 @@ def run_semi_supervised_pipeline(checkpoint_path, epochs, dt_labeled, dt_weak, d
     for epoch in range(epochs):
         print(f"\n==================== Epoch {epoch+1}/{epochs} ====================\n")
         train_history = train_semi_supervised_one_epoch(teacher, student, optimizer, dt_labeled, dt_weak, dt_strong)
-        validation_history, validation_loss = validate_semi_supervised(student, dt_test, device, cfg_metrics)
+        validation_history = validate_semi_supervised(student, dt_test, device, cfg_metrics)
         lr_scheduler.step(validation_history["validation_loss"])
+        early_stopper.step(validation_history["validation_loss"])
         for key, val in train_history.items():
             history[key].append(val)
 
@@ -251,10 +272,12 @@ def run_semi_supervised_pipeline(checkpoint_path, epochs, dt_labeled, dt_weak, d
                 history_val[key] = [val]
             else:
                 history_val[key].append(val)
-        history_val["validation_loss"].append(validation_loss)
         
         plot_losses(history, METRIC_SUPERVISED, METRICS_UNSUPERVISED, save_dir="results")
         plot_validation_results(history_val, VALIDATION_METRICS,  save_dir="results_val")
+        if early_stopper.should_stop:
+            print("\nEARLY STOPPING TRIGGERED — Training stopped.\n")
+            break
 
 
 # pipeline_burn_in(50, dt_train_labeled, device, 3)
