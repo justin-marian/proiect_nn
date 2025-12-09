@@ -12,6 +12,7 @@ from tqdm import tqdm
 from box_ops import BoxList
 from metrics import DetectionMetrics
 from config_params import Metrics
+from torchvision.ops import batched_nms
 from main_utils import (
     save_checkpoint, load_checkpoint, plot_losses, plot_validation_results
 )
@@ -23,7 +24,10 @@ BATCH_SIZE = 2
 CHECKPOINT_DIR = "./checkpoints"
 METRIC_SUPERVISED = ["loss_classifier", "loss_box_reg", "loss_objectness", "loss_rpn_box_reg"]
 METRICS_UNSUPERVISED = ["loss_classifier", "loss_objectness"]
+VALIDATION_METRICS = ["mAP_50", "mAP_5095", "precision", "recall", "f1"]
 LAMBDA_UNSUPERVISED = 5.0
+NMS_IOU = 0.5
+ITERATION_TO_STOP_AT = 5
 
 os.makedirs(CHECKPOINT_DIR, exist_ok=True)
 
@@ -107,10 +111,7 @@ def pipeline_burn_in(epochs, dt_train_labeled, device, checkpoint_every):
             checkpoint_path = os.path.join(CHECKPOINT_DIR, f"checkpoint_epoch_{epoch+1}.pth")
             save_checkpoint(model, optimizer, epoch + 1, checkpoint_path)
 
-# pipeline_burn_in(50, dt_train_labeled, device, 3)
-images, labels = next(iter(dt_train_unlabeled_weakaug))
-from torchvision.ops import batched_nms
-NMS_IOU = 0.5
+
 def generate_pseudo_labels(model : torch.nn.Module, images : torch.Tensor, device):
     model.eval()
     with torch.no_grad():
@@ -139,8 +140,7 @@ def generate_pseudo_labels(model : torch.nn.Module, images : torch.Tensor, devic
             output["scores"] = scores
         return outputs       
     
-# model, optimizer, epoch = load_checkpoint(checkpoint_path=checkpoint_path, optimizer=None, device=device)
-# generate_pseudo_labels(model, images, device)
+
 def train_semi_supervised_one_epoch(teacher : RobustEMA, student, optimizer, dt_labeled, dt_weak, dt_strong):
     student.train()
     train_batches = 0
@@ -152,7 +152,8 @@ def train_semi_supervised_one_epoch(teacher : RobustEMA, student, optimizer, dt_
     history["total"] = 0
 
     for (img_labeled, targets_labeled), (img_weak, _), (img_strong, _) in zip(dt_labeled, dt_weak, dt_strong):
-        if train_batches == 5: break
+        if train_batches == ITERATION_TO_STOP_AT: break
+        print(train_batches)
         # SHOULD REPLACE THE TRANSFORMATION OF HORIZONTAL FLIP WITH SOMETHING PHOTOMETRIC
         weak_targets = generate_pseudo_labels(teacher.ema, img_weak, device)
         
@@ -188,13 +189,13 @@ def train_semi_supervised_one_epoch(teacher : RobustEMA, student, optimizer, dt_
 
 def validate_semi_supervised(student, dt_test, device, cfg_metrics : Metrics):
     student.eval()
-    num_batches = 0
     metrics = DetectionMetrics(cfg_metrics)
     metrics.reset()
-
+    
     with torch.no_grad():
-        for images, targets in dt_test:
-            if num_batches == 5: break
+        for idx, (images, targets) in enumerate(dt_test):
+            if idx == ITERATION_TO_STOP_AT: break
+            print(idx)
             for target in targets:
                 target["boxes"] = target["boxes"].to(device)
                 target["labels"] = target["labels"].to(device)
@@ -203,9 +204,22 @@ def validate_semi_supervised(student, dt_test, device, cfg_metrics : Metrics):
             preds_bl = [BoxList(o["boxes"], o["labels"], o.get("scores", None), (images[0].shape[1], images[0].shape[2])) for o in outputs]
             tgts_bl = [BoxList(t["boxes"], t["labels"], t.get("scores", None), (images[0].shape[1], images[0].shape[2])) for t in targets]
             metrics.update(preds_bl, tgts_bl)
-            num_batches += 1
 
-    return metrics.compute()
+    
+    student.train()
+    loss = 0
+    for idx, (images, targets) in enumerate(dt_test):
+        if idx == ITERATION_TO_STOP_AT: break
+        print(idx)
+        for target in targets:
+            target["boxes"] = target["boxes"].to(device)
+            target["labels"] = target["labels"].to(device)
+        images = images.to(device)
+        loss_dict = student(images, targets)
+        loss += sum(loss_dict.values()).item()
+
+    metrics_dict = metrics.compute()  
+    return metrics_dict, loss / max(1, len(dt_test))
     
 
 def run_semi_supervised_pipeline(checkpoint_path, epochs, dt_labeled, dt_weak, dt_strong, dt_test):
@@ -221,22 +235,28 @@ def run_semi_supervised_pipeline(checkpoint_path, epochs, dt_labeled, dt_weak, d
         history[f"{key}_unsupervised"] = []
     history["total"] = []
     history_val = {}
-    
+    history_val["validation_loss"] = []
+
     for epoch in range(epochs):
         print(f"\n==================== Epoch {epoch+1}/{epochs} ====================\n")
         train_history = train_semi_supervised_one_epoch(teacher, student, optimizer, dt_labeled, dt_weak, dt_strong)
-        validation_history = validate_semi_supervised(student, dt_test, device, cfg_metrics)
-        lr_scheduler.step(train_history["total"])
+        validation_history, validation_loss = validate_semi_supervised(student, dt_test, device, cfg_metrics)
+        lr_scheduler.step(validation_history["validation_loss"])
         for key, val in train_history.items():
             history[key].append(val)
+
+        
         for key, val in validation_history.items():
             if history_val.get(key, None) is None:
                 history_val[key] = [val]
             else:
                 history_val[key].append(val)
+        history_val["validation_loss"].append(validation_loss)
         
         plot_losses(history, METRIC_SUPERVISED, METRICS_UNSUPERVISED, save_dir="results")
-        plot_validation_results(history_val, save_dir="results_val")
+        plot_validation_results(history_val, VALIDATION_METRICS,  save_dir="results_val")
 
+
+# pipeline_burn_in(50, dt_train_labeled, device, 3)
 checkpoint_path="checkpoints/checkpoint_epoch_42.pth"
 run_semi_supervised_pipeline(checkpoint_path, 50, dt_train_labeled, dt_train_unlabeled_weakaug, dt_train_unlabeled_strongaug, dt_test)

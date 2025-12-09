@@ -69,19 +69,14 @@ def plot_losses(history, metrics_supervised, metrics_unsupervised, save_dir=None
         print(f"[INFO] Plot saved to: {out_path}")
 
 
-def plot_validation_results(history, save_dir=None, filename="validation_plot.png"):
+def plot_validation_results(history, validation_metrics, save_dir=None):
     sns.set_theme(style="whitegrid")
     epochs = range(1, len(history[list(history.keys())[0]]) + 1)
     plt.figure(figsize=(10, 6))
-    print(history)
-    print()
 
-
-    # Plot mAP metrics if available
-    if "mAP_50" in history:
-        plt.plot(epochs, history["mAP_50"], label="mAP@0.5", linewidth=2, linestyle=":")
-    if "mAP_5095" in history:
-        plt.plot(epochs, history["mAP_5095"], label="mAP@[0.5:0.95]", linewidth=2, linestyle=":")
+    for metric in validation_metrics:
+        if metric in history:
+          plt.plot(epochs, history[metric], label=metric, linewidth=2)  
 
     plt.title("Validation Loss and Detection Metrics Over Epochs")
     plt.xlabel("Epoch")
@@ -92,6 +87,23 @@ def plot_validation_results(history, save_dir=None, filename="validation_plot.pn
 
     if save_dir is not None:
         os.makedirs(save_dir, exist_ok=True)
-        out_path = os.path.join(save_dir, filename)
+        out_path = os.path.join(save_dir, "validation_accuracy_plot.png")
+        plt.savefig(out_path, dpi=300, bbox_inches="tight")
+        print(f"[INFO] Validation plot saved to: {out_path}")
+
+    
+    plt.figure(figsize=(10, 6))
+    plt.plot(epochs, history["validation_loss"], label="validation_loss", linewidth=2)  
+
+    plt.title("Validation Loss Over Epochs")
+    plt.xlabel("Epoch")
+    plt.ylabel("Value")
+    plt.legend()
+    plt.tight_layout()
+    # plt.show()
+
+    if save_dir is not None:
+        os.makedirs(save_dir, exist_ok=True)
+        out_path = os.path.join(save_dir, "validation_loss_plot.png")
         plt.savefig(out_path, dpi=300, bbox_inches="tight")
         print(f"[INFO] Validation plot saved to: {out_path}")

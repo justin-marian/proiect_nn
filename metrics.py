@@ -38,6 +38,7 @@ class DetectionMetrics:
     def init_pr_stats(self, num_classes: int) -> dict[int, dict[str, float]]:
         return {c: {"tp": 0.0, "fp": 0.0, "fn": 0.0} for c in range(num_classes)}
 
+
     def select_boxes_for_class(
         self,
         pred_bl: BoxList,
@@ -330,13 +331,15 @@ class DetectionMetrics:
 
         # reuse shared precision/recall/F1 computation
         precision_per_class, recall_per_class, f1_per_class = self.prec_rec_f1(pr_stats)
-
+        final_precision = sum(precision_per_class.values()) / max(1, len(precision_per_class.values()))
+        final_recall = sum(recall_per_class.values()) / max(1, len(recall_per_class.values()))
+        final_f1 = sum(f1_per_class.values()) / max(1, len(f1_per_class.values()))
         return {
-            "avg_per_per_cls": avg_per_per_cls,
+            # "avg_per_per_cls": avg_per_per_cls,
             "mAP_50": mAP_50,
             "mAP_5095": mAP_5095,
-            "precision": precision_per_class,
-            "recall": recall_per_class,
-            "f1": f1_per_class,
+            "precision": final_precision,
+            "recall": final_recall,
+            "f1": final_f1,
         }
     
