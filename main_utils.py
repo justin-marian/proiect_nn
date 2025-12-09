@@ -1,6 +1,10 @@
 import torch
 import numpy as np
 import random
+import os
+from model_factory import get_model
+import matplotlib.pyplot as plt
+import seaborn as sns
 
 def set_seed(seed):
     random.seed(seed)
@@ -11,3 +15,83 @@ def set_seed(seed):
         torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
+
+def save_checkpoint(model, optimizer, epoch, path):
+    checkpoint = {
+        'epoch': epoch,
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+    }
+    torch.save(checkpoint, path)
+    print(f"Checkpoint saved at {path}")
+
+def load_checkpoint(checkpoint_path, optimizer=None, device='cuda'):
+    if not os.path.exists(checkpoint_path):
+        raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
+
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    
+    model = get_model(device=device)
+    model.load_state_dict(checkpoint['model_state_dict'])
+    print(f"Model weights loaded from {checkpoint_path}")
+    if optimizer and 'optimizer_state_dict' in checkpoint:
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        print(f"Optimizer state loaded from {checkpoint_path}")
+
+    epoch = checkpoint.get('epoch', 0)
+    print(f"Resuming from epoch {epoch}")
+    return model, optimizer, epoch
+
+def plot_losses(history, metrics_supervised, metrics_unsupervised, save_dir=None, filename="train_loss_plot.png"):
+    sns.set_theme(style="whitegrid")
+    epochs = range(1, len(history["total"]) + 1)
+    plt.figure(figsize=(8, 5))
+
+    for comp in metrics_supervised:
+        plt.plot(epochs, history[f"{comp}_supervised"], label=f"Train {comp}_supervised", linewidth=2)
+    for comp in metrics_unsupervised:
+        plt.plot(epochs, history[f"{comp}_unsupervised"], label=f"Train {comp}_unsupervised", linewidth=2)
+        
+    plt.plot(epochs, history["total"], label="Train total", linewidth=2)
+
+    plt.title("Training Loss Components Over Epochs")
+    plt.xlabel("Epoch")
+    plt.ylabel("Loss")
+    plt.legend()
+    plt.tight_layout()
+    # plt.show()
+
+    # Save to disk
+    if save_dir is not None:
+        os.makedirs(save_dir, exist_ok=True)
+        out_path = os.path.join(save_dir, filename)
+        plt.savefig(out_path, dpi=300, bbox_inches="tight")
+        print(f"[INFO] Plot saved to: {out_path}")
+
+
+def plot_validation_results(history, save_dir=None, filename="validation_plot.png"):
+    sns.set_theme(style="whitegrid")
+    epochs = range(1, len(history[list(history.keys())[0]]) + 1)
+    plt.figure(figsize=(10, 6))
+    print(history)
+    print()
+
+
+    # Plot mAP metrics if available
+    if "mAP_50" in history:
+        plt.plot(epochs, history["mAP_50"], label="mAP@0.5", linewidth=2, linestyle=":")
+    if "mAP_5095" in history:
+        plt.plot(epochs, history["mAP_5095"], label="mAP@[0.5:0.95]", linewidth=2, linestyle=":")
+
+    plt.title("Validation Loss and Detection Metrics Over Epochs")
+    plt.xlabel("Epoch")
+    plt.ylabel("Value")
+    plt.legend()
+    plt.tight_layout()
+    # plt.show()
+
+    if save_dir is not None:
+        os.makedirs(save_dir, exist_ok=True)
+        out_path = os.path.join(save_dir, filename)
+        plt.savefig(out_path, dpi=300, bbox_inches="tight")
+        print(f"[INFO] Validation plot saved to: {out_path}")

@@ -295,7 +295,8 @@ if __name__ == "__main__":
     A.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
     ToTensorV2(),
     ], bbox_params=A.BboxParams(format='pascal_voc'))
-    train_dt = get_dataloader("train", "2007", transform=train_labeled_transforms, batch_size=32, shuffle=False)
+    train_dt = get_dataloader("train", "2007", transform=train_labeled_transforms, batch_size=32, download=True)
+    train_dt = get_dataloader("train", "2012", transform=train_labeled_transforms, batch_size=32, download=True)
     images, data = next(iter(train_dt))
     print(len(images), images.shape, images[0].shape)
     print(len(data), data[0])

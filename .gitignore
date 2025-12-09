@@ -3,3 +3,5 @@ venv
 __pycache__
 checkpoints
 2102.09480v1.pdf
+results
+results_val
