@@ -1,203 +1,117 @@
+from __future__ import annotations
+
 import copy
-import math
-import warnings
-from typing import Iterable, Optional
+from typing import Any, Dict, Optional, Tuple
 
 import torch
 import torch.nn as nn
 
 
-class RobustEMA:
-    """
-    Robust Exponential Moving Average (EMA) helper for model weights (teacher).
-    - Creates a deep copy of `model` as the EMA (teacher) model.
-    - Disables gradients for EMA model params.
-    - Updates EMA after an optimizer.step() call using a warm-up decay schedule.
-    - Hard-copies BatchNorm running stats & non-float buffers; applies EMA to floats.
-    - Safely handles FP16 by casting model values to ema dtype before update.
-    - Can copy arbitrary non-parameter attributes from online model via update_attr.
-    """
+def unwrap_model(m: nn.Module) -> nn.Module:
+    return m.module if hasattr(m, "module") else m
 
+
+class EMA:
     def __init__(
         self,
-        model: nn.Module,
-        decay: float = 0.9999,
-        tau: Optional[float] = 2000.0,
-        device: Optional[torch.device] = None,
-        copy_buffers_hard: bool = True,
-        warn_if_mismatch: bool = True,
-    ):
-        assert 0.0 <= decay < 1.0, "decay must be in [0,1)"
-        if tau is not None:
-            assert tau > 0.0, "tau must be positive or None"
+        teacher_model: nn.Module,
+        decay: float = 0.9996,
+        init_from: Optional[nn.Module] = None,
+        adaptive: bool = False,
+        alpha_min: float = 0.99,
+        alpha_max: float = 0.9999,
+    ) -> None:
+        if not (0.0 <= decay < 1.0):
+            raise ValueError("Decay must be in [0,1)")
+        if not (0.0 < alpha_min < 1.0 and 0.0 < alpha_max < 1.0 and alpha_min <= alpha_max):
+            raise ValueError("Alpha min/max must be in (0,1) and min <= max")
 
-        self.decay = float(decay)
-        self.tau = tau
-        self.updates = 0  # number of EMA updates performed
-        self.warn_if_mismatch = warn_if_mismatch
-        self.copy_buffers_hard = copy_buffers_hard
-
-        # Deep copy model -> ema model (teacher)
-        self.ema = copy.deepcopy(model).eval()
-        if device is not None:
-            self.ema.to(device)
-
-        # Disable grads for EMA model
+        base = unwrap_model(teacher_model)
+        self.ema = copy.deepcopy(base).eval()
         for p in self.ema.parameters():
             p.requires_grad_(False)
 
-    def _get_decay(self) -> float:
-        """
-        Compute decay for current update step with warm-up.
-        We use a standard warm-up: d = decay * (1 - exp(-t / tau)), clipped to [0, decay].
-        If tau is None, return decay.
-        """
-        if self.tau is None:
+        if init_from is not None:
+            self.copy_matching(self.ema, unwrap_model(init_from))
+
+        self.decay = float(decay)
+        self.adaptive = bool(adaptive)
+        self.alpha_min = float(alpha_min)
+        self.alpha_max = float(alpha_max)
+
+    def model(self) -> nn.Module:
+        return self.ema
+
+    def resolve_alpha(self, conf_mean: Optional[float]) -> float:
+        if not self.adaptive or conf_mean is None:
             return self.decay
-        # warm-up factor in (0,1)
-        warmup = 1.0 - math.exp(-self.updates / float(self.tau))
-        d = self.decay * warmup
-        # numeric safety
-        d = min(max(d, 0.0), self.decay)
-        return d
+        c = float(max(0.0, min(1.0, conf_mean)))
+        return self.alpha_min + (self.alpha_max - self.alpha_min) * c
 
     @torch.no_grad()
-    def update(self, model: nn.Module) -> None:
-        """
-        Update EMA params from `model` (the online model).
-        Must be called AFTER optimizer.step().
-        """
-        self.updates += 1
-        d = self._get_decay()  # decay factor in [0, decay]
-
-        ema_state = self.ema.state_dict()
-        model_state = model.state_dict()
-
-        # Iterate keys from model_state (safe if keys missing in ema, warn)
-        for name, model_val in model_state.items():
-            if name not in ema_state:
-                if self.warn_if_mismatch:
-                    warnings.warn(f"EMA: key '{name}' present in model but missing in ema model; skipping.")
-                continue
-
-            ema_val = ema_state[name]
-
-            # Move model_val to ema device/dtype for safe ops
-            try:
-                model_val_device = model_val.to(ema_val.device)
-            except Exception:
-                model_val_device = model_val
-
-            # Hard-copy non-float tensors (e.g., integers, counters)
-            if not ema_val.dtype.is_floating_point:
-                ema_val.copy_(model_val_device)
-                continue
-
-            # Common BN-running buffers should be hard-copied rather than EMA'd
-            # (running_mean, running_var, num_batches_tracked)
-            if self.copy_buffers_hard and (
-                name.endswith("running_mean")
-                or name.endswith("running_var")
-                or name.endswith("num_batches_tracked")
-            ):
-                ema_val.copy_(model_val_device)
-                continue
-
-            # Finally, apply EMA update for floating tensors.
-            # Cast model val to ema dtype (handles fp16 -> fp32 safety)
-            model_val_cast = model_val_device.to(dtype=ema_val.dtype)
-
-            # ema = d * ema + (1-d) * model
-            # alpha = (1 - d)
-            alpha = 1.0 - d
-            ema_val.mul_(d).add_(model_val_cast, alpha=alpha)
-
-    @torch.no_grad()
-    def update_attr(
+    def update(
         self,
-        model: nn.Module,
-        include: Iterable[str] = (),
-        exclude: Iterable[str] = ("process_group", "reducer"),
-    ) -> None:
-        """
-        Copy selected attributes from the online model to the EMA model.
-        Useful for non-parameter model state (anchors, strides, meta, cfg).
-        - include: if non-empty, only keys in 'include' are copied.
-        - exclude: ignore attributes containing any substring in exclude.
-        """
-        for k, v in model.__dict__.items():
-            if include and k not in include:
-                continue
-            if any(x in k for x in exclude):
-                continue
-            try:
-                setattr(self.ema, k, copy.deepcopy(v))
-            except Exception:
-                # Best-effort: try shallow set and warn
-                try:
-                    setattr(self.ema, k, v)
-                except Exception as e:
-                    warnings.warn(f"EMA.update_attr: could not copy attribute '{k}': {e}")
+        student_model: nn.Module,
+        conf_mean: Optional[float] = None
+    ) -> Tuple[int, int, int]:
+        student = unwrap_model(student_model)
 
-    def state_dict(self) -> dict:
-        """Return a dict that can be saved. Contains ema state_dict and bookkeeping."""
+        ema_sd = self.ema.state_dict()
+        stu_sd = student.state_dict()
+
+        alpha = self.resolve_alpha(conf_mean)
+        one_minus = 1.0 - alpha
+
+        updated = 0
+        missing = 0
+        shape_mismatch = 0
+
+        for k, ema_v in ema_sd.items():
+            stu_v = stu_sd.get(k, None)
+            if stu_v is None:
+                missing += 1
+                continue
+            if ema_v.shape != stu_v.shape:
+                shape_mismatch += 1
+                continue
+
+            if ema_v.dtype.is_floating_point and stu_v.dtype.is_floating_point:
+                ema_v.mul_(alpha).add_(
+                    stu_v.detach().to(ema_v.device, dtype=ema_v.dtype),
+                    alpha=one_minus)
+            else:
+                ema_v.copy_(
+                    stu_v.detach().to(ema_v.device, dtype=ema_v.dtype))
+
+            updated += 1
+
+        self.ema.load_state_dict(ema_sd, strict=False)
+        return updated, missing, shape_mismatch
+
+    def state_dict(self) -> Dict[str, Any]:
         return {
-            "ema_state_dict": self.ema.state_dict(),
-            "updates": self.updates,
             "decay": self.decay,
-            "tau": self.tau,
+            "adaptive": self.adaptive,
+            "alpha_min": self.alpha_min,
+            "alpha_max": self.alpha_max,
+            "ema": self.ema.state_dict(),
         }
 
-    def load_state_dict(self, sd: dict, map_location: Optional[torch.device] = None):
-        """
-        Load EMA state. Accepts `sd` with keys from state_dict().
-        map_location: optional device to map EMA model to.
-        """
-        if "ema_state_dict" in sd:
-            state = sd["ema_state_dict"]
-            # map tensors to ema device if specified
-            if map_location is not None:
-                # load into ema model (which may already be on some device)
-                self.ema.load_state_dict(torch.load(state, map_location=map_location) if isinstance(state, str) else state)
-            else:
-                self.ema.load_state_dict(state)
-        else:
-            raise KeyError("state_dict must contain 'ema_state_dict'")
-
-        self.updates = int(sd.get("updates", self.updates))
+    def load_state_dict(self, sd: Dict[str, Any]) -> None:
         self.decay = float(sd.get("decay", self.decay))
-        self.tau = sd.get("tau", self.tau)
+        self.adaptive = bool(sd.get("adaptive", self.adaptive))
+        self.alpha_min = float(sd.get("alpha_min", self.alpha_min))
+        self.alpha_max = float(sd.get("alpha_max", self.alpha_max))
+        self.ema.load_state_dict(sd["ema"], strict=False)
 
-    def to(self, device: torch.device):
-        """Move EMA model to device."""
-        self.ema.to(device)
-
-    def __repr__(self):
-        return f"RobustEMA(decay={self.decay}, tau={self.tau}, updates={self.updates})"
-
-
-# ---------------------
-# Example usage snippet
-# ---------------------
-#
-# model = get_model(...)
-# ema = RobustEMA(model, decay=0.9999, tau=2000.0, device=device)
-# optimizer = torch.optim.SGD(model.parameters(), lr=1e-3, momentum=0.9)
-#
-# for data in loader:
-#     loss = ...
-#     optimizer.zero_grad(); loss.backward(); optimizer.step()
-#     # Update EMA after optimizer.step()
-#     ema.update(model)
-#     # if some metadata changed (anchors, strides), sync attributes:
-#     ema.update_attr(model, include=("anchor_generator", "strides", "num_classes"))
-#
-# # Save
-# torch.save({"model_state": model.state_dict(),
-#             "ema_state": ema.state_dict(),
-#             "optimizer": optimizer.state_dict()}, "chkpt.pth")
-#
-# # Load (example)
-# chk = torch.load("chkpt.pth", map_location=device)
-# model.load_state_dict(chk["model_state"])
-# ema.load_state_dict(chk["ema_state"], map_location=device)
+    @staticmethod
+    @torch.no_grad()
+    def copy_matching(dst: nn.Module, src: nn.Module) -> None:
+        dst_sd = dst.state_dict()
+        src_sd = src.state_dict()
+        for k, v in dst_sd.items():
+            sv = src_sd.get(k, None)
+            if sv is None or sv.shape != v.shape:
+                continue
+            v.copy_(sv.detach().to(v.device, dtype=v.dtype))
+        dst.load_state_dict(dst_sd, strict=False)
