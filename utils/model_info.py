@@ -1,149 +1,137 @@
+from __future__ import annotations
+from __future__ import print_function
+
 import os
-from typing import Callable
+from typing import Callable, Optional
+
 import numpy as np
+
 import torch
 from torch import nn
 import torch.nn.functional as F
 from torch.utils import data
+
 import matplotlib.pyplot as plt
-import seaborn as sns
+import matplotlib.figure as fig
 from loguru import logger
 
 
 def plot_dists(
-    val_dict: dict[str, np.ndarray],
-    color: str = "C0",
-    xlabel: str | None = None,
-    stat: str = "count",
-    use_kde: bool = False,
-    path: str = "output",
-    name: str = "distributions.png"
-):
-    """
-    Plot distributions for a collection of arrays (one subplot per entry).
-    Create a single-row figure with one subplot for each key. 
-    Each subplot displays a histogram of the corresponding array using
-    seaborn.histplot. Intended to be used for quick inspection of weight,
-    gradient or activation distributions in neural networks.
-    """
-    os.makedirs(path, exist_ok=True)
-    columns = len(val_dict)
-    fig, ax = plt.subplots(1, columns, figsize=(columns * 3, 2.5))
-    fig_index = 0
+    values: dict[str, np.ndarray],
+    xlabel: Optional[str],
+    bins: int = 30,
+    density: bool = False,
+    out_dir: str = "output",
+    file_name: str = "distributions.png",
+) -> fig.Figure:
+    os.makedirs(out_dir, exist_ok=True)
 
-    for key in sorted(val_dict.keys()):
-        key_ax = ax[fig_index % columns] if columns > 1 else ax
-        sns.histplot(
-            val_dict[key], ax=key_ax, color=color, bins=50, stat=stat,
-            kde=use_kde and ((val_dict[key].max() - val_dict[key].min()) > 1e-8)
-        )
+    keys = sorted(values.keys())
+    ncols = max(1, len(keys))
+    fig, axes = plt.subplots(1, ncols, figsize=(ncols * 3.2, 2.6))
+    if ncols == 1:
+        axes = [axes]
 
-        val_counts = val_dict[key].shape[0]
-        conditional = val_dict[key].shape[1] if len(val_dict[key].shape) > 1 else 1
-        key_ax.set_title(
-            f"{key} " + (r"(%i $\to$ %i)" % conditional)
-            if conditional > 1 else "(%i vals)" % val_counts
-        )
+    for ax, key in zip(axes, keys):
+        arr = np.asarray(values[key]).reshape(-1)
+        if arr.size == 0:
+            ax.set_title(f"{key} (empty)")
+            ax.axis("off")
+            continue
 
+        ax.hist(arr, bins=bins, density=density)
+        ax.set_title(f"{key} ({arr.size} vals)")
         if xlabel is not None:
-            key_ax.set_xlabel(xlabel)
-        fig_index += 1
+            ax.set_xlabel(xlabel)
 
-    fig.subplots_adjust(wspace=0.4)
-    save_path = os.path.join(path, name)
+    fig.subplots_adjust(wspace=0.35)
+    save_path = os.path.join(out_dir, file_name)
     fig.savefig(save_path, dpi=300, bbox_inches="tight", pad_inches=0.1)
     logger.info(f"Saved plot to {save_path}")
     return fig
 
 
 def visualize_weight_distribution(
-    model: nn.Module, 
-    color: str = "C0",
-    path: str = "output",
-    name: str = "weights"
-):
-    """
-    Visualize the distribution of trainable (non-bias) weights in a model.
-    This function collects all parameters from except those whose names end with ".bias",
-    flattens each parameter tensor to a 1-D NumPy array, and plots their distributions. 
-    Each parameter tensor is labeled by the layer index inferred from the parameter name
-    (e.g., "Layer 0", "Layer 1", ...). The resulting figure is displayed and then closed.
-    """
-    weights = {}
-    for pname, param in model.named_parameters():
-        if pname.endswith(".bias"):
+    model: nn.Module, *,
+    out_dir: str = "output",
+    file_name: str = "weights.png",
+) -> None:
+    weights: dict[str, np.ndarray] = {}
+    for name, p in model.named_parameters():
+        if not p.requires_grad:
             continue
-        key_name = f"Layer {pname.split('.')[1]}"
-        weights[key_name] = param.detach().view(-1).cpu().numpy()
+        if name.endswith(".bias"):
+            continue
+        weights[name] = p.detach().cpu().view(-1).numpy()
+
+    if not weights:
+        logger.warning("No non-bias trainable parameters found.")
+        return
 
     plt.ioff()
-    fig = plot_dists(weights, color=color, xlabel="Weight vals", path=path, name=name + ".png")
+    fig = plot_dists(weights, xlabel="Weight value", out_dir=out_dir, file_name=file_name)
     fig.suptitle("Weight distribution", fontsize=14, y=1.05)
     plt.close(fig)
 
 
 def visualize_gradients(
     model: nn.Module,
-    color: str = "C0",
-    train_set: data.Dataset = None,
-    device: torch.device = None,
+    train_set: data.Dataset, *,
+    device: Optional[torch.device],
     batch_size: int = 256,
-    path: str = "output/gradients",
-    name: str = "gradients"
-):
-    """
-    Visualize the distribution of gradient magnitudes across model weights after one backward pass.
-    Perform a single forward and backward step using a small batch of samples
-    from the provided training dataset. It collects gradients of all parameters whose names contain
-    "weight", flattens them to 1-D arrays, and plots their magnitude distributions.
-    Each layer's gradients are represented as a separate distribution curve in the resulting plot.
-    Optionally, the variance of each layer's gradients can be printed to the console.
-    """
+    out_dir: str = "output",
+    file_name: str = "gradients.png",
+) -> None:
+    if train_set is None:
+        raise ValueError("Train set must be provided to visualize gradients.")
+
     model.eval()
     if device is None:
         device = next(model.parameters()).device
     model.to(device)
 
-    small_loader = data.DataLoader(train_set, batch_size=batch_size, shuffle=False)
-    imgs, labels = next(iter(small_loader))
+    loader = data.DataLoader(train_set, batch_size=batch_size, shuffle=False)
+    imgs, labels = next(iter(loader))
     imgs, labels = imgs.to(device), labels.to(device)
 
-    model.zero_grad()
+    model.zero_grad(set_to_none=True)
     preds = model(imgs)
     loss = F.cross_entropy(preds, labels)
     loss.backward()
 
-    grads = {
-        name: param.grad.detach().view(-1).abs().cpu().numpy()
-        for name, param in model.named_parameters()
-        if "weight" in name and param.grad is not None
-    }
-    model.zero_grad()
+    grads: dict[str, np.ndarray] = {}
+    for name, p in model.named_parameters():
+        if "weight" not in name:
+            continue
+        if p.grad is None:
+            continue
+        # Take absolute value of gradients to analyze magnitude distribution
+        grads[name] = p.grad.detach().abs().cpu().view(-1).numpy()
+
+    model.zero_grad(set_to_none=True)
+
+    if not grads:
+        logger.warning("No gradients collected (no 'weight' grads found).")
+        return
 
     plt.ioff()
-    fig = plot_dists(grads, color=color, xlabel="Grad magnitude", path=path, name=name + ".png")
+    fig = plot_dists(grads, xlabel="|grad|", out_dir=out_dir, file_name=file_name)
     fig.suptitle("Gradient distribution", fontsize=14, y=1.05)
     plt.close(fig)
 
 
 def visualize_activations(
     model: nn.Module,
-    color: str = "C0",
-    print_variance: bool = False,
-    train_set: data.Dataset = None,
-    device: torch.device = None,
+    train_set: data.Dataset, *,
+    device: Optional[torch.device],
     batch_size: int = 256,
     max_samples_per_layer: int = 100_000,
-    path: str = "output/activations",
-    name: str = "activations"
-):
-    """
-    Visualize the distribution of neuron activations across linear/conv layers in a model.
-    Uses a single (small) batch to avoid OOM. Each layer's activations are subsampled if
-    they exceed `max_samples_per_layer` to keep CPU memory usage bounded.
-    """
+    out_dir: str = "output",
+    file_name: str = "activations.png",
+    print_variance: bool = False,
+) -> None:
     if train_set is None:
-        logger.warning("No train_set provided to visualize_activations; skipping.")
+        logger.warning("No train set provided, skipping activation visualization.")
         return
 
     model.eval()
@@ -158,47 +146,50 @@ def visualize_activations(
     activations: dict[str, np.ndarray] = {}
     hooks = []
 
-    def make_hook(label: str) -> Callable:
-        def hook(model, input, output):
-            tensor_out = output[0] if isinstance(output, tuple) else output
-            with torch.no_grad():
-                flat = tensor_out.detach().view(-1)
-                n = flat.numel()
-                if n > max_samples_per_layer:
-                    idx = torch.randperm(n, device=flat.device)[:max_samples_per_layer]
-                    flat = flat[idx]
-                activations[label] = flat.cpu().numpy()
+    def register_hook(layer_name: str) -> Callable:
+        def hook(_, __, output):
+            out = output[0] if isinstance(output, tuple) else output
+            flat = out.detach().reshape(-1)
+
+            # Subsample if too many activations to avoid memory issues
+            # Take random subset to get representative distribution
+            if flat.numel() > max_samples_per_layer:
+                idx = torch.randperm(flat.numel(), device=flat.device)[:max_samples_per_layer]
+                flat = flat[idx]
+
+            activations[layer_name] = flat.cpu().numpy()
         return hook
 
-    idx = 0
-    for _, module in model.named_modules():
+    # Register hooks on Linear and Conv2d layers to capture activations
+    # during forward pass through the model
+    layer_idx = 0
+    for module in model.modules():
         if isinstance(module, (nn.Linear, nn.Conv2d)):
-            label = f"{module.__class__.__name__} {idx}"
-            hooks.append(module.register_forward_hook(make_hook(label)))
-            idx += 1
+            name = f"{module.__class__.__name__} {layer_idx}"
+            hooks.append(module.register_forward_hook(register_hook(name)))
+            layer_idx += 1
 
     with torch.no_grad():
         _ = model(imgs)
+
     for h in hooks:
         h.remove()
 
     if not activations:
-        logger.warning("No activations were collected (no Linear/Conv2d layers found).")
+        logger.warning("No activations collected (no Linear/Conv2d layers found).")
         return
 
     if print_variance:
-        for key in sorted(activations.keys()):
-            logger.info(f"{key} - Variance: {np.var(activations[key])}")
+        for k in sorted(activations.keys()):
+            logger.info(f"{k} variance: {np.var(activations[k])}")
 
     plt.ioff()
     fig = plot_dists(
         activations,
-        color=color,
-        stat="density",
-        use_kde=False,
-        xlabel="Activation vals",
-        path=path,
-        name=name + ".png"
+        xlabel="Activation value",
+        density=True,
+        out_dir=out_dir,
+        file_name=file_name,
     )
     fig.suptitle("Activation distribution", fontsize=14, y=1.05)
     plt.close(fig)
